@@ -22,7 +22,7 @@ def wrist_in_line(wrist_x, wrist_z, frame_width, x_threshold = 0.1, z_threshold 
     horizontal_ok = delta_x <= x_threshold * frame_width
     depth_ok = wrist_z < z_threshold
 
-    return horizontal_ok and depth_ok
+    return horizontal_ok, depth_ok
 
 def get_pixel_coordinates(landmark, frame_width, frame_height) :
     x = int(landmark.x * frame_width)
