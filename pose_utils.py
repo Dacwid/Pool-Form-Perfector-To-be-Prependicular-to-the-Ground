@@ -31,5 +31,5 @@ def get_pixel_coordinates(landmark, frame_width, frame_height) :
     return x, y, z
 
 def forearm_angle(finger, wrist, gravity_vec) :
-    arm_vec = vector(finger, wrist)
+    arm_vec = vector(wrist, finger)
     return angle_between(arm_vec, gravity_vec)
