@@ -1,85 +1,98 @@
 import cv2
+import time
+import torch
 from gravity import get_gravity_vector
 from pose_utils import *
 
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+from ultralytics import YOLO
+
+WRIST_IDX = 10
+ELBOW_IDX = 8
 
 def main():
 
+    if torch.cuda.is_available():
+        device = "cuda"
+        print(f"[GPU] Using {torch.cuda.get_device_name(0)}")
+    else:
+        device = "cpu"
+        print("[CPU] CUDA not available — install CUDA-enabled PyTorch for GPU.")
+        print("      pip uninstall torch -y")
+        print("      pip install torch --index-url https://download.pytorch.org/whl/cu121")
 
-    # MediaPipe Setup
-    BaseOptions = python.BaseOptions
-    HandLandmarker = vision.HandLandmarker
-    HandLandmarkerOptions = vision.HandLandmarkerOptions
-    RunningMode = vision.RunningMode
+    pose_model = YOLO("yolo11x-pose.pt")
+    pose_model.to(device)
+    hand_model = YOLO("yolo11n-pose.pt")
+    hand_model.to(device)
 
-    # Hand Model
-    hand_options = HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path="models/hand_landmarker.task"),
-        running_mode=RunningMode.VIDEO,
-        num_hands=1,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-    hand_detector = HandLandmarker.create_from_options(hand_options)
-
-    # Camera Setup
+    #initialize variables needed
     camera_index = 0
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError("Could not open any camera.")
 
-    # Gravity Setup
     accelerometer_data = None
     gravity_vec = get_gravity_vector(accelerometer_data)
 
-    # Constants
-    WRIST_IDX = 0
-    FOREARM_REF_IDX = 18
+    VISIBILITY_THRESHOLD = 0.4      # confidence. lower for noisy cameras, higher for better cameras
     PERPENDICULAR_TOLERANCE = 10
+
+    camera_tilt_deg = 0.0
+    TILT_STEP = 1.0
 
     fade_message = ""
     fade_start_time = 0
     fade_duration = 2.0
 
-    # Timestamp Setup
-    frame_timestamp_ms = 0
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    prev_time = time.time()
+    fps = 0.0
 
-    # Main Loop
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_timestamp_ms += int(1000 / fps)
-
         h, w, _ = frame.shape
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        hand_results = hand_detector.detect_for_video(mp_image, frame_timestamp_ms)
+        now = time.time()
+        dt = now - prev_time
+        prev_time = now
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt)
 
-        # Filter for right hand only
-        right_hand_landmarks = None
-        if hand_results.hand_landmarks and hand_results.handedness:
-            for i, handedness in enumerate(hand_results.handedness):
-                if handedness[0].category_name == "Right":
-                    right_hand_landmarks = hand_results.hand_landmarks[i]
-                    break
+        if camera_tilt_deg != 0.0:
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), camera_tilt_deg, 1.0)
+            frame = cv2.warpAffine(frame, M, (w, h))
 
-        if right_hand_landmarks:
-            wrist_lm = right_hand_landmarks[WRIST_IDX]
-            ref_lm = right_hand_landmarks[FOREARM_REF_IDX]
+        # run pose model
+        results = pose_model(frame, verbose=False, device=device)[0]
 
-            wx, wy, wz = get_pixel_coordinates(wrist_lm, w, h)
-            rx, ry, rz = get_pixel_coordinates(ref_lm, w, h)
+        wx = wy = wz = ex = ey = None
+        detector_label = "NONE"
 
-            angle = forearm_angle((rx, ry), (wx, wy), gravity_vec)
+        if results.keypoints is not None and len(results.keypoints) > 0:
+            kps = results.keypoints[0]
 
+            kp_data = kps.data[0].cpu().numpy()
+
+            wrist_x, wrist_y, wrist_conf = kp_data[WRIST_IDX]
+            elbow_x, elbow_y, elbow_conf = kp_data[ELBOW_IDX]
+
+            # check if confidence is above the set threshold
+            if wrist_conf >= VISIBILITY_THRESHOLD and elbow_conf >= VISIBILITY_THRESHOLD:
+                detector_label = "POSE"
+                wx, wy = int(wrist_x), int(wrist_y)
+                ex, ey = int(elbow_x), int(elbow_y)
+                wz = 0
+
+        if wx is not None:
+            # get forearm points which is middle of wrist and elbow
+            fx, fy = (wx + ex) // 2, (wy + ey) // 2
+
+            # math the angle using forearm vector and gravity vector
+            angle = forearm_angle((wx, wy), (ex, ey), gravity_vec)
+
+            # check if within limits set
             is_perpendicular = angle <= PERPENDICULAR_TOLERANCE
             perp_status = "PERPENDICULAR" if is_perpendicular else f"OFF BY {angle:.1f} deg"
             perp_color = (0, 255, 0) if is_perpendicular else (0, 0, 255)
@@ -92,19 +105,19 @@ def main():
             z_status = "GOOD DISTANCE" if is_in_depth else "BAD DISTANCE"
             z_color = (0, 255, 0) if is_in_depth else (0, 0, 255)
 
-            # Draw joints
-            cv2.circle(frame, (wx, wy), 10, (0, 255, 0), -1)
-            cv2.circle(frame, (rx, ry), 8, (255, 255, 0), -1)
-            cv2.line(frame, (wx, wy), (rx, ry), (255, 255, 255), 3)
+            # draw the points and lines
+            cv2.circle(frame, (wx, wy), 10, (0, 255, 0),   -1)
+            cv2.circle(frame, (ex, ey), 10, (255, 0, 255), -1)
+            cv2.circle(frame, (fx, fy),  8, (255, 255, 0), -1)
+            cv2.line(frame, (wx, wy), (ex, ey), (255, 255, 255), 3)
 
-            # Line extension
-            dx, dy = rx - wx, ry - wy
-            ex_f, ey_f = wx + int(dx * 2), wy + int(dy * 2)
-            ex_w, ey_w = wx - int(dx * 3), wy - int(dy * 3)
-            cv2.line(frame, (rx, ry), (ex_f, ey_f), (200, 200, 200), 1)
-            cv2.line(frame, (wx, wy), (ex_w, ey_w), (200, 200, 200), 1)
+            dx, dy = ex - wx, ey - wy
+            ext_f = (wx + int(dx * 2), wy + int(dy * 2))
+            ext_w = (wx - int(dx * 1), wy - int(dy * 1))
+            cv2.line(frame, (ex, ey), ext_f, (200, 200, 200), 1)
+            cv2.line(frame, (wx, wy), ext_w, (200, 200, 200), 1)
 
-            # Text
+            # write stats on on screen
             cv2.putText(frame, f"Forearm Angle: {angle:.1f} deg", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
             cv2.putText(frame, perp_status, (20, 80),
@@ -116,68 +129,66 @@ def main():
             cv2.putText(frame, z_status, (20, 200),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, z_color, 3)
 
-
         else:
-            cv2.putText(frame, "Right hand not detected", (20, 40),
+            cv2.putText(frame, "Not detected", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
+        badge_color = (255, 180, 0) if detector_label == "POSE" else (0, 0, 200)
+        cv2.rectangle(frame, (w - 140, 10), (w - 10, 45), badge_color, -1)
+        cv2.putText(frame, detector_label, (w - 130, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+
+        cv2.putText(frame, f"{fps:.1f} FPS  [{device.upper()}]",
+                    (w - 220, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2)
+
+        cv2.putText(frame, f"Cam Tilt: {camera_tilt_deg:.1f} deg",
+                    (20, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2)
+
+        # write control instructions
         help_lines = [
-            "1: Pinky",
-            "2: Index",
-            "3: Thumb",
+            "]: Tilt CW",
+            "[: Tilt CCW",
             "C: Switch Cam",
             "ESC: Exit"
         ]
-
         y0 = h - 20
         for i, text in enumerate(help_lines[::-1]):
             cv2.putText(frame, text,
-                        (w - 180, y0 - i * 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (200, 200, 200),
-                        2)
+                        (w - 200, y0 - i * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
-        # show frame
         if fade_message:
             current_time = cv2.getTickCount() / cv2.getTickFrequency()
             elapsed = current_time - fade_start_time
-
             if elapsed < fade_duration:
                 alpha = 1.0 - (elapsed / fade_duration)
-
                 overlay = frame.copy()
-                cv2.putText(overlay, fade_message,
-                            (50, h - 50),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0,
-                            (0, 0, 255),
-                            3)
-
+                cv2.putText(overlay, fade_message, (50, h - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
             else:
                 fade_message = ""
 
         cv2.imshow("Forearm Tracker", frame)
 
-        # Key presses
-
+        # inputs
         key = cv2.waitKey(1) & 0xFF
-
-        if key == 27:  # ESC
+        if key == 27:
             break
-        elif key == ord('1'):
-            FOREARM_REF_IDX = 18
-        elif key == ord('2'):
-            FOREARM_REF_IDX = 5
-        elif key == ord('3'):
-            FOREARM_REF_IDX = 3
+        elif key == ord('['):
+            camera_tilt_deg -= TILT_STEP
+            fade_message = f"Tilt: {camera_tilt_deg:.1f} deg"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        elif key == ord(']'):
+            camera_tilt_deg += TILT_STEP
+            fade_message = f"Tilt: {camera_tilt_deg:.1f} deg"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
         elif key in (ord('c'), ord('C')):
             new_index = 1 - camera_index
             new_cap = cv2.VideoCapture(new_index)
-
             if not new_cap.isOpened():
-                # Trigger fade message
                 fade_message = "No other camera found"
                 fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
                 new_cap.release()

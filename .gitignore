@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & temp files
+*.log
+*.tmp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+learn_nn_from_scratch.py
+my_first_model.npz
+learn_pytorch_tensorflow.py
+model.pth
+CLAUDE.md
+
+# Model weights
+*.pt
