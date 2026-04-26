@@ -3,7 +3,7 @@ import math
 
 def vector(p1, p2) :
     # Finds distance of two coordinates
-    return np.array([p2[0] - p1[0], p2[1] - p1[1]])
+    return np.array([p1[0] - p2[0], p1[1] - p2[1]])
 
 def angle_between(v1, v2) :
     # Applies the formula to determine the angle based on v1, vector between elbow and wrist, and v2, gravity vector
@@ -12,11 +12,11 @@ def angle_between(v1, v2) :
     dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
     return  math.degrees(math.acos(dot))
 
-def wrist_in_line(wrist_x, wrist_z, frame_width, x_threshold = 0.1, z_threshold = 0.15 ) :
+def wrist_in_line(wrist_x, wrist_z, frame_width, x_threshold = 0.04, z_threshold = 0.15 ) :
     # Makes sure the wrist is in line with the camera for proper detection
     # Threshold makes sure wrist doesn't have to be in the perfect right place but still in the center of the screen
     # and not too far away from the camera
-    center_x = frame_width / 2
+    center_x = frame_width / 2 
     delta_x = abs(wrist_x - center_x)
 
     horizontal_ok = delta_x <= x_threshold * frame_width
@@ -30,6 +30,6 @@ def get_pixel_coordinates(landmark, frame_width, frame_height) :
     z = landmark.z
     return x, y, z
 
-def forearm_angle(finger, wrist, gravity_vec) :
+def forearm_angle(wrist, finger, gravity_vec) :
     arm_vec = vector(wrist, finger)
     return angle_between(arm_vec, gravity_vec)
