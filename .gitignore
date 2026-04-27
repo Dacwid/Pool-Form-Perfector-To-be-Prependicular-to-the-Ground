@@ -30,8 +30,10 @@ desktop.ini
 learn_nn_from_scratch.py
 my_first_model.npz
 learn_pytorch_tensorflow.py
+gestures.py
 model.pth
 CLAUDE.md
+tasks/
 
 # Model weights
 *.pt

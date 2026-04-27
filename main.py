@@ -1,13 +1,14 @@
 import cv2
 import time
+import numpy as np
 import torch
 from gravity import get_gravity_vector
 from pose_utils import *
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 from ultralytics import YOLO
-
-WRIST_IDX = 10
-ELBOW_IDX = 8
 
 def main():
 
@@ -22,8 +23,6 @@ def main():
 
     pose_model = YOLO("yolo11x-pose.pt")
     pose_model.to(device)
-    hand_model = YOLO("yolo11n-pose.pt")
-    hand_model.to(device)
 
     #initialize variables needed
     camera_index = 0
@@ -34,8 +33,32 @@ def main():
     accelerometer_data = None
     gravity_vec = get_gravity_vector(accelerometer_data)
 
+    # YOLOV11 indexes
+    WRIST_IDX = 10
+    ELBOW_IDX = 8
+
+    # mediapipe indexes
+    THUMB_TIP_IDX = 4
+    THUM_BASE_IDX = 2
+    INDEX_FINGER_TIP_IDX = 8
+    INDEX_FINGER_BASE_IDX = 5
+    MIDDLE_FINGER_TIP_IDX = 12
+    MIDDLE_FINGER_BASE_IDX = 9
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    mp_hands = mp.solutions.hands
+    hand = mp_hands.Hands(static_image_mode = False,
+                        max_num_hands = 1,
+                        min_detection_confidence = 0.5,
+                        min_tracking_confidence = 0.5
+                      )
+
     VISIBILITY_THRESHOLD = 0.4      # confidence. lower for noisy cameras, higher for better cameras
     PERPENDICULAR_TOLERANCE = 10
+    TARGET_FOREARM_PX = 100              # just test for your own environemnt
+
+    mp_drawing = mp.solutions.drawing_utils
 
     camera_tilt_deg = 0.0
     TILT_STEP = 1.0
@@ -46,6 +69,11 @@ def main():
 
     prev_time = time.time()
     fps = 0.0
+
+    locked_id = None
+    zoom_locked = False
+    last_crop = None  
+
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -64,26 +92,62 @@ def main():
             M = cv2.getRotationMatrix2D((w / 2, h / 2), camera_tilt_deg, 1.0)
             frame = cv2.warpAffine(frame, M, (w, h))
 
-        # run pose model
-        results = pose_model(frame, verbose=False, device=device)[0]
+        # so overlays dont get changed colorwise
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l_chan, a_chan, b_chan = cv2.split(lab)
+        l_chan = clahe.apply(l_chan)
+        proc_frame = cv2.cvtColor(cv2.merge((l_chan, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
+
+        mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # run pose model with tracking
+        results = pose_model.track(proc_frame, verbose=False, device=device, persist=True)[0]
+        results_mp = hand.process(mp_frame)
 
         wx = wy = wz = ex = ey = None
         detector_label = "NONE"
 
-        if results.keypoints is not None and len(results.keypoints) > 0:
-            kps = results.keypoints[0]
+        if (results.boxes is not None
+                and results.boxes.id is not None
+                and results.keypoints is not None):
+            ids = results.boxes.id.cpu().numpy().astype(int)
+            boxes = results.boxes.xywh.cpu().numpy()
 
-            kp_data = kps.data[0].cpu().numpy()
+            # if no one is locked, or our locked person disappeared, pick the one closest to centre
+            if locked_id is None or locked_id not in ids:
+                dists = [abs(box[0] - w / 2) for box in boxes]
+                locked_id = int(ids[int(np.argmin(dists))])
 
-            wrist_x, wrist_y, wrist_conf = kp_data[WRIST_IDX]
-            elbow_x, elbow_y, elbow_conf = kp_data[ELBOW_IDX]
+            if locked_id in ids:
+                idx = int(np.where(ids == locked_id)[0][0])
+                kp_data = results.keypoints[idx].data[0].cpu().numpy()
 
-            # check if confidence is above the set threshold
-            if wrist_conf >= VISIBILITY_THRESHOLD and elbow_conf >= VISIBILITY_THRESHOLD:
-                detector_label = "POSE"
-                wx, wy = int(wrist_x), int(wrist_y)
-                ex, ey = int(elbow_x), int(elbow_y)
-                wz = 0
+                wrist_x, wrist_y, wrist_conf = kp_data[WRIST_IDX]
+                elbow_x, elbow_y, elbow_conf = kp_data[ELBOW_IDX]
+
+                # check if confidence is above the set threshold
+                if wrist_conf >= VISIBILITY_THRESHOLD and elbow_conf >= VISIBILITY_THRESHOLD:
+                    detector_label = f"POSE id:{locked_id}"
+                    wx, wy = int(wrist_x), int(wrist_y)
+                    ex, ey = int(elbow_x), int(elbow_y)
+                    wz = 0
+
+        if results_mp.multi_hand_landmarks:
+            hand_landmarks = results_mp.multi_hand_landmarks[0]
+
+            thumb_tip = hand_landmarks.landmark[THUMB_TIP_IDX]
+            thumb_base = hand_landmarks.landmark[THUM_BASE_IDX]
+            index_tip = hand_landmarks.landmark[INDEX_FINGER_TIP_IDX]
+            index_base = hand_landmarks.landmark[INDEX_FINGER_BASE_IDX]
+            middle_tip = hand_landmarks.landmark[MIDDLE_FINGER_TIP_IDX]
+            middle_base = hand_landmarks.landmark[MIDDLE_FINGER_BASE_IDX]
+
+
+        # status values for overlays (filled in when there's a detection)
+        angle = None
+        perp_status = perp_color = None
+        x_status = x_color = None
+        z_status = z_color = None
 
         if wx is not None:
             # get forearm points which is middle of wrist and elbow
@@ -105,7 +169,7 @@ def main():
             z_status = "GOOD DISTANCE" if is_in_depth else "BAD DISTANCE"
             z_color = (0, 255, 0) if is_in_depth else (0, 0, 255)
 
-            # draw the points and lines
+            # draw the points and lines 
             cv2.circle(frame, (wx, wy), 10, (0, 255, 0),   -1)
             cv2.circle(frame, (ex, ey), 10, (255, 0, 255), -1)
             cv2.circle(frame, (fx, fy),  8, (255, 255, 0), -1)
@@ -117,32 +181,56 @@ def main():
             cv2.line(frame, (ex, ey), ext_f, (200, 200, 200), 1)
             cv2.line(frame, (wx, wy), ext_w, (200, 200, 200), 1)
 
-            # write stats on on screen
-            cv2.putText(frame, f"Forearm Angle: {angle:.1f} deg", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            cv2.putText(frame, perp_status, (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, perp_color, 3)
-            cv2.putText(frame, f"Wrist: ({wx},{wy})", (20, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, x_status, (20, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, x_color, 3)
-            cv2.putText(frame, z_status, (20, 200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, z_color, 3)
+        # zoom happens before text so that text doesnt get clipped off
+        if zoom_locked and last_crop is not None:
+            cx0, cy0, cw, ch = last_crop
+            cropped = frame[cy0:cy0 + ch, cx0:cx0 + cw]
+            display_frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+        elif wx is not None:
+            forearm_len = np.hypot(wx - ex, wy - ey)
+            if forearm_len > 1:
+                zoom = max(1.0, min(TARGET_FOREARM_PX / forearm_len, 4.0))
+            else:
+                zoom = 1.0
 
+            cw, ch = int(w / zoom), int(h / zoom)
+            cx0 = int(fx - cw / 2)
+            cy0 = int(fy - ch / 2)
+            cx0 = max(0, min(cx0, w - cw))
+            cy0 = max(0, min(cy0, h - ch))
+
+            last_crop = (cx0, cy0, cw, ch)
+
+            cropped = frame[cy0:cy0 + ch, cx0:cx0 + cw]
+            display_frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            cv2.putText(frame, "Not detected", (20, 40),
+            display_frame = frame.copy()
+
+        if wx is not None:
+            cv2.putText(display_frame, f"Forearm Angle: {angle:.1f} deg", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            cv2.putText(display_frame, perp_status, (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, perp_color, 3)
+            cv2.putText(display_frame, f"Wrist: ({wx},{wy})", (20, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(display_frame, x_status, (20, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, x_color, 3)
+            cv2.putText(display_frame, z_status, (20, 200),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, z_color, 3)
+        else:
+            cv2.putText(display_frame, "Not detected", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        badge_color = (255, 180, 0) if detector_label == "POSE" else (0, 0, 200)
-        cv2.rectangle(frame, (w - 140, 10), (w - 10, 45), badge_color, -1)
-        cv2.putText(frame, detector_label, (w - 130, 38),
+        badge_color = (255, 180, 0) if detector_label.startswith("POSE") else (0, 0, 200)
+        cv2.rectangle(display_frame, (w - 140, 10), (w - 10, 45), badge_color, -1)
+        cv2.putText(display_frame, detector_label, (w - 130, 38),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
 
-        cv2.putText(frame, f"{fps:.1f} FPS  [{device.upper()}]",
+        cv2.putText(display_frame, f"{fps:.1f} FPS  [{device.upper()}]",
                     (w - 220, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 255, 255), 2)
 
-        cv2.putText(frame, f"Cam Tilt: {camera_tilt_deg:.1f} deg",
+        cv2.putText(display_frame, f"Cam Tilt: {camera_tilt_deg:.1f} deg",
                     (20, h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2)
 
@@ -151,11 +239,13 @@ def main():
             "]: Tilt CW",
             "[: Tilt CCW",
             "C: Switch Cam",
+            "R: Re-lock Person",
+            "Z: Lock Crop Ratio"
             "ESC: Exit"
         ]
         y0 = h - 20
         for i, text in enumerate(help_lines[::-1]):
-            cv2.putText(frame, text,
+            cv2.putText(display_frame, text,
                         (w - 200, y0 - i * 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
@@ -164,14 +254,14 @@ def main():
             elapsed = current_time - fade_start_time
             if elapsed < fade_duration:
                 alpha = 1.0 - (elapsed / fade_duration)
-                overlay = frame.copy()
+                overlay = display_frame.copy()
                 cv2.putText(overlay, fade_message, (50, h - 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                cv2.addWeighted(overlay, alpha, display_frame, 1 - alpha, 0, display_frame)
             else:
                 fade_message = ""
 
-        cv2.imshow("Forearm Tracker", frame)
+        cv2.imshow("Forearm Tracker", display_frame)
 
         # inputs
         key = cv2.waitKey(1) & 0xFF
@@ -185,6 +275,14 @@ def main():
             camera_tilt_deg += TILT_STEP
             fade_message = f"Tilt: {camera_tilt_deg:.1f} deg"
             fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        elif key == ord('\\'):
+            camera_tilt_deg = 0
+            fade_message = f"Tilt reset"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        elif key in (ord('r'), ord('R')):          # change this to peace sign
+            locked_id = None
+            fade_message = "Re-locking person"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
         elif key in (ord('c'), ord('C')):
             new_index = 1 - camera_index
             new_cap = cv2.VideoCapture(new_index)
@@ -196,6 +294,14 @@ def main():
                 cap.release()
                 cap = new_cap
                 camera_index = new_index
+        elif key in (ord('z'), ord('Z')):           # change this to thumbs up
+            zoom_locked = not zoom_locked
+            if zoom_locked:
+                fade_message = f"Zoom ratio locked"
+                fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+            elif not zoom_locked:
+                fade_message = f"Zoom ratio unlocked"
+                fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
 
     cap.release()
     cv2.destroyAllWindows()
