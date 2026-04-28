@@ -33,3 +33,36 @@ def get_pixel_coordinates(landmark, frame_width, frame_height) :
 def forearm_angle(wrist, finger, gravity_vec) :
     arm_vec = vector(wrist, finger)
     return angle_between(arm_vec, gravity_vec)
+
+WRIST_LM = 0
+THUMB_MCP = 2
+THUMB_TIP = 4
+INDEX_PIP = 6
+INDEX_TIP = 8
+MIDDLE_MCP = 9
+MIDDLE_PIP = 10
+MIDDLE_TIP = 12
+RING_PIP = 14
+RING_TIP = 16
+PINKY_PIP = 18
+PINKY_TIP = 20
+
+# basic logic is if tip more than base then that finger is raised, if not then it is down
+def is_peace(lms):
+    if lms is None:
+        return False
+    index_extended  = lms[INDEX_TIP][1]  < lms[INDEX_PIP][1]
+    middle_extended = lms[MIDDLE_TIP][1] < lms[MIDDLE_PIP][1]
+    ring_folded     = lms[RING_TIP][1]   > lms[RING_PIP][1]
+    pinky_folded    = lms[PINKY_TIP][1]  > lms[PINKY_PIP][1]
+    return index_extended and middle_extended and ring_folded and pinky_folded
+
+def is_thumbs_up(lms):
+    if lms is None:
+        return False
+    thumb_up      = lms[THUMB_TIP][1]  < lms[THUMB_MCP][1]
+    index_folded  = lms[INDEX_TIP][1]  > lms[INDEX_PIP][1]
+    middle_folded = lms[MIDDLE_TIP][1] > lms[MIDDLE_PIP][1]
+    ring_folded   = lms[RING_TIP][1]   > lms[RING_PIP][1]
+    pinky_folded  = lms[PINKY_TIP][1]  > lms[PINKY_PIP][1]
+    return thumb_up and index_folded and middle_folded and ring_folded and pinky_folded

@@ -5,7 +5,7 @@ import torch
 from gravity import get_gravity_vector
 from pose_utils import *
 import mediapipe as mp
-from mediapipe.tasks import python
+from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 from ultralytics import YOLO
@@ -37,28 +37,29 @@ def main():
     WRIST_IDX = 10
     ELBOW_IDX = 8
 
-    # mediapipe indexes
-    THUMB_TIP_IDX = 4
-    THUM_BASE_IDX = 2
-    INDEX_FINGER_TIP_IDX = 8
-    INDEX_FINGER_BASE_IDX = 5
-    MIDDLE_FINGER_TIP_IDX = 12
-    MIDDLE_FINGER_BASE_IDX = 9
+    # mediapipe hand landmark indices
+    WRIST_LM = 0
+    MIDDLE_MCP = 9
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-    mp_hands = mp.solutions.hands
-    hand = mp_hands.Hands(static_image_mode = False,
-                        max_num_hands = 1,
-                        min_detection_confidence = 0.5,
-                        min_tracking_confidence = 0.5
-                      )
+    base_options = mp_python.BaseOptions(model_asset_path="models/hand_landmarker.task")
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    hand = vision.HandLandmarker.create_from_options(hand_options)
 
-    VISIBILITY_THRESHOLD = 0.4      # confidence. lower for noisy cameras, higher for better cameras
+    VISIBILITY_THRESHOLD = 0.4           # confidence. lower for noisy cameras, higher for better cameras
     PERPENDICULAR_TOLERANCE = 10
     TARGET_FOREARM_PX = 100              # just test for your own environemnt
 
-    mp_drawing = mp.solutions.drawing_utils
+    GESTURE_HOLD = 0.5                   # seconds to hold gesture
+    GESTURE_COOLDOWN = 2.0               # cool down to reuse gesture
 
     camera_tilt_deg = 0.0
     TILT_STEP = 1.0
@@ -72,15 +73,18 @@ def main():
 
     locked_id = None
     zoom_locked = False
-    last_crop = None  
+    last_crop = None
 
+    peace_start = None
+    thumbs_start = None
+    last_gesture_fire = 0.0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        h, w, _ = frame.shape
+        h, w, _ = frame.shape   
 
         now = time.time()
         dt = now - prev_time
@@ -98,11 +102,12 @@ def main():
         l_chan = clahe.apply(l_chan)
         proc_frame = cv2.cvtColor(cv2.merge((l_chan, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
 
-        mp_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
 
         # run pose model with tracking
         results = pose_model.track(proc_frame, verbose=False, device=device, persist=True)[0]
-        results_mp = hand.process(mp_frame)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=mp_frame)
+        results_mp = hand.detect_for_video(mp_image, int(now * 1000))
 
         wx = wy = wz = ex = ey = None
         detector_label = "NONE"
@@ -132,18 +137,7 @@ def main():
                     ex, ey = int(elbow_x), int(elbow_y)
                     wz = 0
 
-        if results_mp.multi_hand_landmarks:
-            hand_landmarks = results_mp.multi_hand_landmarks[0]
-
-            thumb_tip = hand_landmarks.landmark[THUMB_TIP_IDX]
-            thumb_base = hand_landmarks.landmark[THUM_BASE_IDX]
-            index_tip = hand_landmarks.landmark[INDEX_FINGER_TIP_IDX]
-            index_base = hand_landmarks.landmark[INDEX_FINGER_BASE_IDX]
-            middle_tip = hand_landmarks.landmark[MIDDLE_FINGER_TIP_IDX]
-            middle_base = hand_landmarks.landmark[MIDDLE_FINGER_BASE_IDX]
-
-
-        # status values for overlays (filled in when there's a detection)
+        # status values for overlays
         angle = None
         perp_status = perp_color = None
         x_status = x_color = None
@@ -169,7 +163,7 @@ def main():
             z_status = "GOOD DISTANCE" if is_in_depth else "BAD DISTANCE"
             z_color = (0, 255, 0) if is_in_depth else (0, 0, 255)
 
-            # draw the points and lines 
+            # draw the points and lines
             cv2.circle(frame, (wx, wy), 10, (0, 255, 0),   -1)
             cv2.circle(frame, (ex, ey), 10, (255, 0, 255), -1)
             cv2.circle(frame, (fx, fy),  8, (255, 255, 0), -1)
@@ -239,14 +233,14 @@ def main():
             "]: Tilt CW",
             "[: Tilt CCW",
             "C: Switch Cam",
-            "R: Re-lock Person",
-            "Z: Lock Crop Ratio"
+            "R / Peace: Re-lock Person",
+            "Z / Thumbs Up: Lock Zoom",
             "ESC: Exit"
         ]
         y0 = h - 20
         for i, text in enumerate(help_lines[::-1]):
             cv2.putText(display_frame, text,
-                        (w - 200, y0 - i * 25),
+                        (w - 280, y0 - i * 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
         if fade_message:
@@ -264,6 +258,62 @@ def main():
         cv2.imshow("Forearm Tracker", display_frame)
 
         # inputs
+
+        # find closest hand since mediapipe has a depth coordinate unlike yolo
+        hand_lms = None
+        if results_mp.hand_landmarks:
+            best = None
+            best_size = -1.0
+            for h_lm in results_mp.hand_landmarks:
+                wrist_lm = h_lm[WRIST_LM]
+                mid_mcp = h_lm[MIDDLE_MCP]
+                size = np.hypot(
+                    (wrist_lm.x - mid_mcp.x) * w,
+                    (wrist_lm.y - mid_mcp.y) * h,
+                )
+                if size > best_size:
+                    best_size = size
+                    best = h_lm
+
+            hand_lms = [(int(lm.x * w), int(lm.y * h)) for lm in best]
+
+        # gesture detection
+        peace_now = is_peace(hand_lms)
+        thumbs_now = is_thumbs_up(hand_lms)
+
+        if peace_now:
+            if peace_start is None:
+                peace_start = now
+        else:
+            peace_start = None
+
+        if thumbs_now:
+            if thumbs_start is None:
+                thumbs_start = now
+        else:
+            thumbs_start = None
+
+        cooldown_ok = (now - last_gesture_fire) >= GESTURE_COOLDOWN
+
+        if (peace_start is not None
+                and (now - peace_start) >= GESTURE_HOLD
+                and cooldown_ok):
+            locked_id = None
+            last_gesture_fire = now
+            peace_start = None
+            fade_message = "Gesture: Re-locking person"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        elif (thumbs_start is not None
+                and (now - thumbs_start) >= GESTURE_HOLD
+                and cooldown_ok):
+            zoom_locked = not zoom_locked
+            last_gesture_fire = now
+            thumbs_start = None
+            fade_message = "Gesture: Zoom locked" if zoom_locked else "Gesture: Zoom unlocked"
+            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+
+        # key inputs
+
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
@@ -279,10 +329,12 @@ def main():
             camera_tilt_deg = 0
             fade_message = f"Tilt reset"
             fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
-        elif key in (ord('r'), ord('R')):          # change this to peace sign
-            locked_id = None
-            fade_message = "Re-locking person"
-            fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        elif key in (ord('r'), ord('R')):
+            if cooldown_ok and peace_start is None:
+                locked_id = None
+                last_gesture_fire = now
+                fade_message = "Re-locking person"
+                fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
         elif key in (ord('c'), ord('C')):
             new_index = 1 - camera_index
             new_cap = cv2.VideoCapture(new_index)
@@ -294,13 +346,11 @@ def main():
                 cap.release()
                 cap = new_cap
                 camera_index = new_index
-        elif key in (ord('z'), ord('Z')):           # change this to thumbs up
-            zoom_locked = not zoom_locked
-            if zoom_locked:
-                fade_message = f"Zoom ratio locked"
-                fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
-            elif not zoom_locked:
-                fade_message = f"Zoom ratio unlocked"
+        elif key in (ord('z'), ord('Z')):
+            if cooldown_ok and thumbs_start is None:
+                zoom_locked = not zoom_locked
+                last_gesture_fire = now
+                fade_message = "Zoom ratio locked" if zoom_locked else "Zoom ratio unlocked"
                 fade_start_time = cv2.getTickCount() / cv2.getTickFrequency()
 
     cap.release()
